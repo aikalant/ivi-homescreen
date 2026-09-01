@@ -62,7 +62,15 @@ void zero_out(T* out) {
 
 // Surface paths in best-to-floor priority (ihs/platform_view.h): a zero-copy
 // GPU import beats direct-scanout beats the universal software floor.
+//
+// TEXTURE_EGL_IMAGE leads because it is the shortest path there is: the driver
+// already holds a complete representation of the frame, so nothing is described,
+// exported or rebuilt. A producer that can offer both it and a dma-buf is
+// telling us it has the image in hand either way, and taking the image skips an
+// export on its side and an import on ours. A producer that can only export a
+// dma-buf simply does not set this bit and lands on the next entry.
 constexpr uint32_t kKindPriority[] = {
+    IHS_PV_KIND_TEXTURE_EGL_IMAGE,
     IHS_PV_KIND_TEXTURE_DMABUF_IMPORT,
     IHS_PV_KIND_DRM_PLANE,
     IHS_PV_KIND_SOFTWARE_SHM,
@@ -268,6 +276,31 @@ extern "C" int ihs_pv_submit(IhsPlatformView* view,
                    out_release_fence_fd);
 }
 
+extern "C" int ihs_pv_submit_image(IhsPlatformView* view,
+                                   const IhsImageFrame* frame,
+                                   int acquire_fence_fd,
+                                   int* out_release_fence_fd) {
+  if (out_release_fence_fd != nullptr) {
+    *out_release_fence_fd = -1;
+  }
+  if (frame == nullptr || frame->struct_size == 0 ||
+      frame->egl_image == nullptr) {
+    return IHS_PV_ERR_INVALID;
+  }
+  const IhsPvHost* h = host();
+  if (h == nullptr) {
+    return IHS_PV_ERR_NO_REGISTRY;
+  }
+  // Appended to IhsPvHost after the initial layout, so a shell that predates
+  // the image kind has a shorter table: check the size before reading the slot,
+  // or this reads past the end of the host's struct.
+  if (h->struct_size < sizeof(IhsPvHost) || h->submit_image == nullptr) {
+    return IHS_PV_ERR_NO_BACKEND;
+  }
+  return h->submit_image(h->user_data, view, frame, acquire_fence_fd,
+                         out_release_fence_fd);
+}
+
 // --- host installation (ihs/platform_view_host.h) ---------------------------
 
 extern "C" void ihs_pv_set_host(const IhsPvHost* host) {
@@ -286,7 +319,7 @@ const IhsPlatformViewApi* platform_view_api() noexcept {
       &ihs_pv_register_factory,   &ihs_pv_unregister_factory,
       &ihs_pv_negotiate,          &ihs_pv_grant_drm_plane_id,
       &ihs_pv_grant_shm_fd,       &ihs_pv_submit,
-      &ihs_pv_assets_path,
+      &ihs_pv_assets_path,        &ihs_pv_submit_image,
   };
   return &api;
 }

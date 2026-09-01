@@ -48,6 +48,12 @@ class EglDmabufImporter {
     // data. Packed RGB stays on GL_TEXTURE_2D, which every GLES context
     // supports.
     bool external{false};
+    // Whether memory row 0 is the visual top. Constant true for a dma-buf
+    // import; a submitted EGLImage answers for itself (ImportImage).
+    bool top_first{true};
+    // Whether Destroy() owns @egl_image. False for ImportImage, where the
+    // image belongs to the producer and only the texture name is ours.
+    bool owns_image{true};
   };
 
   EglDmabufImporter() = default;
@@ -74,6 +80,22 @@ class EglDmabufImporter {
   // RGB stays GL_TEXTURE_2D. ImportedTexture::external says which, and the
   // caller must sample with a matching sampler. GL context must be current.
   bool Import(const IhsFrame& frame, ImportedTexture* out) const;
+
+  // Bind an EGLImage the producer already created on this display to a texture
+  // (IHS_PV_KIND_TEXTURE_EGL_IMAGE). The short half of Import: there is no
+  // eglCreateImageKHR, because the image exists — for a producer that cannot
+  // export a dma-buf at all, or whose buffer carries a vendor compression
+  // format the DRM plane model cannot describe.
+  //
+  // @image is **borrowed**: the result has owns_image = false, so Destroy()
+  // deletes the texture name and leaves the image to its owner. GL context
+  // must be current, as for Import.
+  bool ImportImage(void* image,
+                   uint32_t width,
+                   uint32_t height,
+                   bool external,
+                   bool top_first,
+                   ImportedTexture* out) const;
 
   void Destroy(ImportedTexture* out) const;
 

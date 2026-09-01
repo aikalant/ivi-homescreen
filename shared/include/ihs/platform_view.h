@@ -154,6 +154,11 @@ typedef struct IhsHdrMetadata {
 /*
  * Surface paths a view can travel. A requirement carries a bitmask of the kinds
  * a plugin can produce; a grant names exactly one. Ordered best-to-floor:
+ *   TEXTURE_EGL_IMAGE      plugin hands over an EGLImageKHR it created on the
+ *                          backend's own EGLDisplay; the compositor binds it to
+ *                          a texture and samples it (zero copy, no export). For
+ *                          producers whose frames have no dma-buf
+ *                          representation — see below.
  *   TEXTURE_DMABUF_IMPORT  plugin exports a dma-buf the engine compositor
  *                          samples through the texture registrar (zero copy). A
  *                          GL or Vulkan plugin renders with the shared context
@@ -164,12 +169,28 @@ typedef struct IhsHdrMetadata {
  *                          overlay plane (zero GPU) — direct-scanout HDR video.
  *   SOFTWARE_SHM           universal floor: a CPU-filled shared-memory buffer.
  * A well-formed requirement that includes SOFTWARE_SHM never hard-fails.
+ *
+ * # Why TEXTURE_EGL_IMAGE exists alongside TEXTURE_DMABUF_IMPORT
+ *
+ * A dma-buf fd plus a fourcc and a modifier is a *public description* of a
+ * buffer, and the driver rebuilds its own representation from it. That works
+ * whenever the description is complete, however when the producer cannot export
+ * an fd at all, such as a nested Wayland compositor that receives client
+ * buffers through the driver's own `EGL_WL_bind_wayland_ display` global, the
+ * receiving end gets back an EGLImage. Turning that into a dma-buf needs
+ * EGL_MESA_image_dma_buf_export, which not all drivers do not provide. In this
+ * case the EGLImage the driver already holds is complete and directly
+ * samplable, and the plugin's context shares objects with the compositor's
+ * (see ihs_pv_egl_context), so handing the image over costs nothing and loses
+ * nothing. EGL-backed backends only; a Vulkan or software backend does not
+ * offer this kind.
  */
 typedef enum IhsPvKind {
   IHS_PV_KIND_NONE = 0,
   IHS_PV_KIND_TEXTURE_DMABUF_IMPORT = 1u << 0,
   IHS_PV_KIND_DRM_PLANE = 1u << 1,
-  IHS_PV_KIND_SOFTWARE_SHM = 1u << 2
+  IHS_PV_KIND_SOFTWARE_SHM = 1u << 2,
+  IHS_PV_KIND_TEXTURE_EGL_IMAGE = 1u << 3
 } IhsPvKind;
 
 /* Synchronization the plugin needs / the grant honors. Explicit sync uses an
@@ -567,6 +588,64 @@ IHS_EXPORT int ihs_pv_submit(IhsPlatformView* view,
                              int* out_release_fence_fd);
 
 /*
+ * A produced frame that is already an EGLImage, for
+ * IHS_PV_KIND_TEXTURE_EGL_IMAGE.
+ *
+ * @egl_image is an EGLImageKHR created on the EGLDisplay reported by
+ * ihs_pv_egl_context — the compositor's own display, so the handle is directly
+ * valid to it. The plugin retains ownership: the compositor binds it into a
+ * texture and never destroys it. It must stay alive until the compositor has
+ * released the frame (see the release fence on submit) or the view is disposed.
+ *
+ * @buffer_id names WHICH source buffer this frame is, exactly as on IhsFrame:
+ * the compositor creates one texture per distinct id and reuses it on every
+ * later submit of the same id, so a steady stream costs no per-frame GL object
+ * churn. A producer cycling a ring reuses its ids. **It must be stable per
+ * underlying buffer, not per frame** — and note that an EGLImage *handle* is
+ * not a safe id on its own, because drivers recycle handles as soon as one is
+ * destroyed.
+ *
+ * @external_oes says the texture must be bound to GL_TEXTURE_EXTERNAL_OES and
+ * sampled with samplerExternalOES — true for YUV (a camera, a video decoder),
+ * where the driver performs the conversion. Sampling such an image as
+ * GL_TEXTURE_2D yields raw luma rather than an error, so this must be answered
+ * from the image, never assumed.
+ *
+ * @top_first mirrors ICompositorSurface::TextureIsTopFirst: 0 when memory row 0
+ * is the GL-native bottom, 1 when it is the visual top. The compositor inverts
+ * V at sample time when set.
+ */
+typedef struct IhsImageFrame {
+  size_t struct_size;
+  void* egl_image; /* EGLImageKHR on the backend's EGLDisplay */
+  uint32_t width;  /* source pixels; the compositor scales to the view rect */
+  uint32_t height;
+  uint8_t external_oes; /* 0 or 1; GL_TEXTURE_EXTERNAL_OES when 1 */
+  uint8_t top_first;    /* 0 or 1; see above */
+  uint8_t reserved[2];  /* pad; must be 0 */
+  uint32_t buffer_id;   /* source-buffer identity for texture caching */
+} IhsImageFrame;
+
+/*
+ * Hand the compositor an EGLImage frame for @view, the IhsImageFrame
+ * counterpart of ihs_pv_submit. Valid only under an
+ * IHS_PV_KIND_TEXTURE_EGL_IMAGE grant; returns IHS_PV_ERR_UNSUPPORTED
+ * otherwise.
+ *
+ * Fence handling is identical to ihs_pv_submit: @acquire_fence_fd (-1 for
+ * implicit sync) is consumed by the compositor, and a non-negative
+ * *out_release_fence_fd is owned by the plugin, which must wait on it before
+ * reusing the underlying buffer and must close it in every case.
+ *
+ * The image is bound to a texture lazily, on the raster thread at present, so
+ * this may be called from the plugin's own thread with no GL context current.
+ */
+IHS_EXPORT int ihs_pv_submit_image(IhsPlatformView* view,
+                                   const IhsImageFrame* frame,
+                                   int acquire_fence_fd,
+                                   int* out_release_fence_fd);
+
+/*
  * The platform-view capability sub-table reachable through
  * IhsApi::platform_view. Pointers alias the flat entry points above; a consumer
  * may use either. Grows additively behind struct_size.
@@ -594,6 +673,10 @@ typedef struct IhsPlatformViewApi {
 
   /* Appended after the initial layout; check struct_size before calling. */
   const char* (*assets_path)(void);
+  int (*submit_image)(IhsPlatformView* view,
+                      const IhsImageFrame* frame,
+                      int acquire_fence_fd,
+                      int* out_release_fence_fd);
 } IhsPlatformViewApi;
 
 #ifdef __cplusplus

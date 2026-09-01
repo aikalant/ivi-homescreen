@@ -118,6 +118,11 @@ typedef struct IhsPvHost {
 
   /* Appended after the initial layout; read only when struct_size covers it. */
   const char* (*assets_path)(void* user_data);
+  int (*submit_image)(void* user_data,
+                      IhsPlatformView* view,
+                      const IhsImageFrame* frame,
+                      int acquire_fence_fd,
+                      int* out_release_fence_fd);
 } IhsPvHost;
 
 /*

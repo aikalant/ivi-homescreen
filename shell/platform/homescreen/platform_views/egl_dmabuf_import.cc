@@ -218,6 +218,39 @@ bool EglDmabufImporter::Import(const IhsFrame& frame,
   return true;
 }
 
+bool EglDmabufImporter::ImportImage(void* image,
+                                    const uint32_t width,
+                                    const uint32_t height,
+                                    const bool external,
+                                    const bool top_first,
+                                    ImportedTexture* out) const {
+  if (image == nullptr || out == nullptr || image_target_texture_ == nullptr) {
+    return false;
+  }
+  const GLenum target = external ? GL_TEXTURE_EXTERNAL_OES : GL_TEXTURE_2D;
+  GLuint tex = 0;
+  glGenTextures(1, &tex);
+  glBindTexture(target, tex);
+  glTexParameteri(target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  auto image_target_texture =
+      reinterpret_cast<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(
+          image_target_texture_);
+  image_target_texture(target, static_cast<GLeglImageOES>(image));
+  glBindTexture(target, 0);
+
+  out->texture = tex;
+  out->egl_image = image;  // borrowed; see owns_image
+  out->width = width;
+  out->height = height;
+  out->external = external;
+  out->top_first = top_first;
+  out->owns_image = false;
+  return true;
+}
+
 void EglDmabufImporter::Destroy(ImportedTexture* out) const {
   if (out == nullptr) {
     return;
@@ -226,6 +259,11 @@ void EglDmabufImporter::Destroy(ImportedTexture* out) const {
     const GLuint tex = out->texture;
     glDeleteTextures(1, &tex);
     out->texture = 0;
+  }
+  if (!out->owns_image) {
+    // ImportImage: the image is the producer's, and it outlives this texture.
+    out->egl_image = nullptr;
+    return;
   }
   if (out->egl_image != nullptr && destroy_image_ != nullptr) {
     auto destroy_image =

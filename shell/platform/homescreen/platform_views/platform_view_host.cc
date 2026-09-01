@@ -54,6 +54,12 @@
 #endif
 #if IVI_HAVE_EGL
 #include "egl_dmabuf_import.h"
+// The EGLImage kind binds a texture directly (no eglCreateImageKHR), so it
+// needs the GL entry points and the EXTERNAL_OES target here rather than only
+// inside the dma-buf importer.
+#include <EGL/egl.h>
+#include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
 #endif
 #include "flutter_desktop_view_controller_state.h"
 #include "platform_view.h"
@@ -254,6 +260,19 @@ class IhsPluginView final : public PlatformView, public ICompositorSurface {
   mutable PendingEglFrame pending_egl;
   mutable std::map<uint32_t, EglDmabufImporter::ImportedTexture> buffers_egl;
   mutable EglDmabufImporter::ImportedTexture* current_egl{nullptr};
+
+  // IHS_PV_KIND_TEXTURE_EGL_IMAGE: a producer that hands over the EGLImage
+  // itself rather than a dma-buf. Only the *stash* is separate — the resulting
+  // texture goes into buffers_egl / current_egl / retired_egl with the imports
+  // above, because once bound the two are the same thing. A view is granted one
+  // kind, so at most one of the two stashes is ever populated.
+  struct PendingImageFrame {
+    bool valid{false};
+    IhsImageFrame frame{};
+    // As PendingEglFrame::acquire_fence_fd.
+    int acquire_fence_fd{-1};
+  };
+  mutable PendingImageFrame pending_image;
   struct RetiredEglImport {
     EglDmabufImporter::ImportedTexture texture;
     uint64_t reap_at{0};
@@ -399,7 +418,13 @@ class IhsPluginView final : public PlatformView, public ICompositorSurface {
   }
   // Imported dma-bufs are top-first (row 0 is the top), so the EGL compositor
   // must V-flip when sampling into its bottom-first framebuffer.
-  [[nodiscard]] bool TextureIsTopFirst() const override { return true; }
+  [[nodiscard]] bool TextureIsTopFirst() const override {
+    // Imported dma-bufs are always top-first; a submitted EGLImage answers for
+    // itself, because a nested compositor's client can have written either way
+    // round. ImportedTexture::top_first carries both cases.
+    const std::lock_guard<std::mutex> lock(mutex);
+    return current_egl == nullptr || current_egl->top_first;
+  }
 
   // Direct-scanout seam for the DRM compositor: expose the latest submitted
   // frame's dma-buf so it can be placed on a KMS overlay plane instead of being
@@ -676,6 +701,14 @@ IhsPluginView::~IhsPluginView() {
     defer_egl(r.texture);
   }
   retired_egl.clear();
+
+  // The EGLImage kind: its textures are in buffers_egl above and were already
+  // deferred; only the stash is separate.
+  if (pending_image.acquire_fence_fd >= 0) {
+    close(pending_image.acquire_fence_fd);
+    pending_image.acquire_fence_fd = -1;
+  }
+  pending_image.valid = false;
 #endif
 }
 
@@ -702,44 +735,95 @@ void CloseFrameFds(const IhsFrame* frame) {
 }
 
 #if IVI_HAVE_EGL
+// Block until a producer's acquire fence signals, so we never sample ahead of
+// it. Shared by both EGL stashes (dma-buf and image).
+//
+// The lock is dropped across the (bounded) wait so a wedged fence cannot block
+// a submit or a dispose; ownership of the fd is taken first so a superseding
+// submit will not close it, and the loop re-reads @valid because a frame may
+// have arrived — or the view been disposed — while unlocked. On timeout or
+// error we sample best-effort and warn.
+void WaitAcquireFence(std::unique_lock<std::mutex>& lock,
+                      const bool& valid,
+                      int& fence_fd) {
+  while (valid && fence_fd >= 0) {
+    const int fence = fence_fd;
+    fence_fd = -1;
+    lock.unlock();
+    pollfd pfd{fence, POLLIN, 0};
+    int pr = 0;
+    while ((pr = ::poll(&pfd, 1, 1000)) < 0 && errno == EINTR) {
+    }
+    // Only POLLIN means the fence signalled; poll() can also wake on
+    // POLLERR/POLLHUP/POLLNVAL (>0 with no POLLIN), which is a failure.
+    if (pr <= 0 || (pfd.revents & POLLIN) == 0) {
+      ihs::log::warn(
+          "[ihs_pv] acquire-fence wait {} (fd={}, revents=0x{:x}); sampling "
+          "anyway — frame may tear",
+          pr == 0 ? "timed out" : "failed", fence, pfd.revents);
+    }
+    close(fence);
+    lock.lock();
+  }
+}
+#endif
+
+#if IVI_HAVE_EGL
 // Raster-thread lazy import for the EGL path: HostSubmit stashed the frame
 // (plugin thread, no GL context); import it here, where the EGL compositor
 // calls us with the context current, caching per ring buffer like the Vulkan
 // path.
 uint32_t IhsPluginView::GetGlTextureName() const {
   std::unique_lock<std::mutex> lock(mutex);
+  // IHS_PV_KIND_TEXTURE_EGL_IMAGE. Shorter than the dma-buf path below because
+  // the image already exists on this display: there is nothing to describe and
+  // nothing to rebuild, only a texture name to hang on it. Everything after the
+  // bind — the cache, the retire list, the deferred destroy — is shared with
+  // the dma-buf imports, because once bound the two are the same object.
+  if (pending_image.valid) {
+    WaitAcquireFence(lock, pending_image.valid, pending_image.acquire_fence_fd);
+    if (!pending_image.valid) {
+      return current_egl != nullptr ? current_egl->texture : 0;
+    }
+    const IhsImageFrame& f = pending_image.frame;
+    const auto it = buffers_egl.find(f.buffer_id);
+    if (it != buffers_egl.end() && it->second.egl_image == f.egl_image &&
+        it->second.width == f.width && it->second.height == f.height) {
+      // Cache hit. The identity check on egl_image is load-bearing — drivers
+      // recycle EGLImage handles as soon as one is destroyed, so a stale entry
+      // under a reused id would sample a destroyed image and draw garbage
+      // rather than fail.
+      current_egl = &it->second;
+    } else {
+      if (it != buffers_egl.end()) {
+        retired_egl.push_back({it->second, submit_seq + 8});
+        buffers_egl.erase(it);
+      }
+      EglDmabufImporter::ImportedTexture imported;
+      if (g_egl_importer.ImportImage(f.egl_image, f.width, f.height,
+                                     f.external_oes != 0U, f.top_first != 0U,
+                                     &imported)) {
+        auto [pos, ins] = buffers_egl.insert_or_assign(f.buffer_id, imported);
+        current_egl = &pos->second;
+        ihs::log::debug(
+            "[ihs_pv] bound EGLImage {} -> texture {} ({}x{}, external={}, "
+            "top_first={}, buffer_id={})",
+            f.egl_image, imported.texture, f.width, f.height,
+            f.external_oes != 0U, f.top_first != 0U, f.buffer_id);
+      } else {
+        ihs::log::error("[ihs_pv] failed to bind a submitted EGLImage");
+      }
+    }
+    pending_image.valid = false;
+    return current_egl != nullptr ? current_egl->texture : 0;
+  }
   if (pending_egl.valid) {
     // The GL-texture fallback samples the buffer directly with no plane
     // IN_FENCE_FD, so block until the producer's writes complete before
-    // sampling, then release the fence. Only reached when direct scanout is
-    // unavailable (the fence otherwise rides the plane's IN_FENCE_FD via
-    // GetDmabuf), so this wait is off the hot path. Drop the lock across the
-    // (bounded) wait so a wedged fence can't block HostSubmit or dispose; take
-    // ownership of the fd first so a superseding submit won't close it, and
-    // loop so a frame that arrived while unlocked is also waited on — we never
-    // sample ahead of the producer. On timeout/error we sample best-effort but
-    // warn.
-    while (pending_egl.valid && pending_egl.acquire_fence_fd >= 0) {
-      const int fence = pending_egl.acquire_fence_fd;
-      pending_egl.acquire_fence_fd = -1;
-      lock.unlock();
-      pollfd pfd{fence, POLLIN, 0};
-      int pr = 0;
-      while ((pr = ::poll(&pfd, 1, 1000)) < 0 && errno == EINTR) {
-      }
-      // Only POLLIN means the fence signalled; poll() can also wake on
-      // POLLERR/POLLHUP/POLLNVAL (>0 with no POLLIN), which is a failure, not a
-      // signal. Sample best-effort either way, but warn.
-      if (pr <= 0 || (pfd.revents & POLLIN) == 0) {
-        ihs::log::warn(
-            "[ihs_pv] GL-fallback acquire-fence wait {} (fd={}, "
-            "revents=0x{:x});"
-            " sampling anyway — frame may tear",
-            pr == 0 ? "timed out" : "failed", fence, pfd.revents);
-      }
-      close(fence);
-      lock.lock();
-    }
+    // sampling. Only reached when direct scanout is unavailable (the fence
+    // otherwise rides the plane's IN_FENCE_FD via GetDmabuf), so this wait is
+    // off the hot path.
+    WaitAcquireFence(lock, pending_egl.valid, pending_egl.acquire_fence_fd);
     // The view may have been disposed while the lock was dropped for the wait.
     if (!pending_egl.valid) {
       return current_egl != nullptr ? current_egl->texture : 0;
@@ -997,6 +1081,14 @@ int HostQueryCapabilities(void* user_data, IhsPvCapabilities* out) {
     BackendEglContext egl{};
     if (backend->GetEglContext(&egl)) {
       out->kinds |= IHS_PV_KIND_TEXTURE_DMABUF_IMPORT;
+      // An EGL backend can also take the image itself. Offered whenever there
+      // is an EGLDisplay to share, because that is the entire requirement — the
+      // producer creates the image on it and we bind a texture to it. This is
+      // the only zero-copy path for a producer that cannot export a dma-buf at
+      // all (a nested Wayland compositor on a driver without
+      // EGL_MESA_image_dma_buf_export), and the only one that keeps a vendor
+      // compression format whose metadata does not fit the DRM plane model.
+      out->kinds |= IHS_PV_KIND_TEXTURE_EGL_IMAGE;
       // The DRM-KMS-EGL backend (gbm_device set; wayland-egl leaves it null)
       // runs the plane compositor, which can scan out a submitted dma-buf
       // directly on a KMS overlay plane — offer the zero-copy DRM_PLANE kind.
@@ -1333,6 +1425,70 @@ int HostSubmit(void* user_data,
 }
 #endif  // IVI_HAVE_VULKAN
 
+// IHS_PV_KIND_TEXTURE_EGL_IMAGE submit. Much shorter than HostSubmit: there are
+// no fds to take ownership of and no import to cache here, because the image is
+// already a live object on this backend's own EGLDisplay. All this does is
+// stash it for GetGlTextureName to bind on the raster thread, exactly as the
+// EGL dma-buf path stashes into pending_egl.
+int HostSubmitImage(void* user_data,
+                    IhsPlatformView* view,
+                    const IhsImageFrame* frame,
+                    int acquire_fence_fd,
+                    int* out_release_fence_fd) {
+  if (out_release_fence_fd != nullptr) {
+    *out_release_fence_fd = -1;
+  }
+  auto* v = reinterpret_cast<IhsPluginView*>(view);
+  // A struct too short to carry buffer_id cannot be normalized safely: the
+  // import-cache key would read as garbage and alias another buffer's texture.
+  const size_t kMinSize = offsetof(IhsImageFrame, buffer_id) + sizeof(uint32_t);
+  if (v == nullptr || frame == nullptr || frame->struct_size < kMinSize ||
+      frame->egl_image == nullptr) {
+    if (acquire_fence_fd >= 0) {
+      close(acquire_fence_fd);
+    }
+    return IHS_PV_ERR_INVALID;
+  }
+  if (v->granted_kind != IHS_PV_KIND_TEXTURE_EGL_IMAGE) {
+    if (acquire_fence_fd >= 0) {
+      close(acquire_fence_fd);
+    }
+    return IHS_PV_ERR_UNSUPPORTED;
+  }
+#if IVI_HAVE_EGL
+  // The plugin may be built against an older, smaller IhsImageFrame; copy only
+  // what it provided, leaving later fields zero.
+  IhsImageFrame normalized{};
+  const size_t copy = frame->struct_size < sizeof(IhsImageFrame)
+                          ? frame->struct_size
+                          : sizeof(IhsImageFrame);
+  std::memcpy(&normalized, frame, copy);
+  normalized.struct_size = sizeof(IhsImageFrame);
+
+  {
+    const std::lock_guard<std::mutex> lock(v->mutex);
+    ++v->submit_seq;
+    HandBackReleaseFence(v, acquire_fence_fd, out_release_fence_fd);
+    // Supersede: the previous frame was never bound, so its fence is ours to
+    // close. The compositor only ever samples the latest submit.
+    if (v->pending_image.acquire_fence_fd >= 0) {
+      close(v->pending_image.acquire_fence_fd);
+    }
+    v->pending_image.frame = normalized;
+    v->pending_image.acquire_fence_fd = acquire_fence_fd;
+    v->pending_image.valid = true;
+  }
+  // Outside the view lock, as the dma-buf paths do: this reaches the engine.
+  ScheduleEngineFrame(user_data);
+  return IHS_PV_OK;
+#else
+  if (acquire_fence_fd >= 0) {
+    close(acquire_fence_fd);
+  }
+  return IHS_PV_ERR_UNSUPPORTED;
+#endif
+}
+
 // Process-global host; user_data re-points at the most recently installed
 // engine (single-engine today).
 const char* HostAssetsPath(void* user_data) {
@@ -1366,6 +1522,7 @@ void InstallPlatformViewHost(FlutterDesktopEngineState* engine_state) {
   g_host.grant_drm_plane_id = HostGrantDrmPlaneId;
   g_host.grant_shm_fd = HostGrantShmFd;
   g_host.submit = HostSubmit;
+  g_host.submit_image = HostSubmitImage;
   ihs_pv_set_host(&g_host);
 
   // Bring up the dma-buf importer once, on this thread, from the backend's
